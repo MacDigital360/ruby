@@ -1390,13 +1390,22 @@ vm_throw_start(const rb_execution_context_t *ec, rb_control_frame_t *const reg_c
     }
     else if (state == TAG_RETURN) {
 	const VALUE *current_ep = GET_EP();
-	const VALUE *target_lep = VM_EP_LEP(current_ep);
+        const VALUE *target_ep = NULL, *target_lep, *ep = current_ep;
 	int in_class_frame = 0;
 	int toplevel = 1;
 	escape_cfp = reg_cfp;
 
-	while (escape_cfp < eocfp) {
-	    const VALUE *lep = VM_CF_LEP(escape_cfp);
+        // find target_lep, target_ep
+        while (!VM_ENV_LOCAL_P(ep)) {
+            if (VM_ENV_FLAGS(ep, VM_FRAME_FLAG_LAMBDA) && target_ep == NULL) {
+                target_ep = ep;
+            }
+            ep = VM_ENV_PREV_EP(ep);
+        }
+        target_lep = ep;
+
+        while (escape_cfp < eocfp) {
+            const VALUE *lep = VM_CF_LEP(escape_cfp);
 
 	    if (!target_lep) {
 		target_lep = lep;
@@ -1414,7 +1423,7 @@ vm_throw_start(const rb_execution_context_t *ec, rb_control_frame_t *const reg_c
 		    toplevel = 0;
 		    if (in_class_frame) {
 			/* lambda {class A; ... return ...; end} */
-			goto valid_return;
+                        goto valid_return;
 		    }
 		    else {
 			const VALUE *tep = current_ep;
@@ -1422,7 +1431,12 @@ vm_throw_start(const rb_execution_context_t *ec, rb_control_frame_t *const reg_c
 			while (target_lep != tep) {
 			    if (escape_cfp->ep == tep) {
 				/* in lambda */
-				goto valid_return;
+                                if (tep == target_ep) {
+                                    goto valid_return;
+                                }
+                                else {
+                                    goto unexpected_return;
+                                }
 			    }
 			    tep = VM_ENV_PREV_EP(tep);
 			}
@@ -1434,7 +1448,12 @@ vm_throw_start(const rb_execution_context_t *ec, rb_control_frame_t *const reg_c
 		      case ISEQ_TYPE_MAIN:
                         if (toplevel) {
                             if (in_class_frame) goto unexpected_return;
-                            goto valid_return;
+                            if (target_ep == NULL) {
+                                goto valid_return;
+                            }
+                            else {
+                                goto unexpected_return;
+                            }
                         }
 			break;
 		      case ISEQ_TYPE_EVAL:
@@ -1448,7 +1467,12 @@ vm_throw_start(const rb_execution_context_t *ec, rb_control_frame_t *const reg_c
 	    }
 
 	    if (escape_cfp->ep == target_lep && escape_cfp->iseq->body->type == ISEQ_TYPE_METHOD) {
-		goto valid_return;
+                if (target_ep == NULL) {
+                    goto valid_return;
+                }
+                else {
+                    goto unexpected_return;
+                }
 	    }
 
 	    escape_cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(escape_cfp);
@@ -3969,7 +3993,7 @@ vm_once_clear(VALUE data)
 
 /* defined insn */
 
-static enum defined_type
+static bool
 check_respond_to_missing(VALUE obj, VALUE v)
 {
     VALUE args[2];
@@ -3978,53 +4002,42 @@ check_respond_to_missing(VALUE obj, VALUE v)
     args[0] = obj; args[1] = Qfalse;
     r = rb_check_funcall(v, idRespond_to_missing, 2, args);
     if (r != Qundef && RTEST(r)) {
-	return DEFINED_METHOD;
+	return true;
     }
     else {
-	return DEFINED_NOT_DEFINED;
+	return false;
     }
 }
 
-static VALUE
-vm_defined(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, rb_num_t op_type, VALUE obj, VALUE needstr, VALUE v)
+static bool
+vm_defined(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, rb_num_t op_type, VALUE obj, VALUE v)
 {
     VALUE klass;
-    enum defined_type expr_type = DEFINED_NOT_DEFINED;
     enum defined_type type = (enum defined_type)op_type;
 
     switch (type) {
       case DEFINED_IVAR:
-	if (rb_ivar_defined(GET_SELF(), SYM2ID(obj))) {
-	    expr_type = DEFINED_IVAR;
-	}
+        return rb_ivar_defined(GET_SELF(), SYM2ID(obj));
 	break;
       case DEFINED_GVAR:
-	if (rb_gvar_defined(SYM2ID(obj))) {
-	    expr_type = DEFINED_GVAR;
-	}
+        return rb_gvar_defined(SYM2ID(obj));
 	break;
       case DEFINED_CVAR: {
         const rb_cref_t *cref = vm_get_cref(GET_EP());
         klass = vm_get_cvar_base(cref, GET_CFP(), 0);
-	if (rb_cvar_defined(klass, SYM2ID(obj))) {
-	    expr_type = DEFINED_CVAR;
-	}
+        return rb_cvar_defined(klass, SYM2ID(obj));
 	break;
       }
       case DEFINED_CONST:
       case DEFINED_CONST_FROM: {
 	bool allow_nil = type == DEFINED_CONST;
 	klass = v;
-        if (vm_get_ev_const(ec, klass, SYM2ID(obj), allow_nil, true)) {
-	    expr_type = DEFINED_CONST;
-	}
+        return vm_get_ev_const(ec, klass, SYM2ID(obj), allow_nil, true);
 	break;
       }
       case DEFINED_FUNC:
 	klass = CLASS_OF(v);
-	if (rb_ec_obj_respond_to(ec, v, SYM2ID(obj), TRUE)) {
-	    expr_type = DEFINED_METHOD;
-	}
+        return rb_ec_obj_respond_to(ec, v, SYM2ID(obj), TRUE);
 	break;
       case DEFINED_METHOD:{
 	VALUE klass = CLASS_OF(v);
@@ -4039,20 +4052,20 @@ vm_defined(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, rb_num_t op_
 		    break;
 		}
 	      case METHOD_VISI_PUBLIC:
-		expr_type = DEFINED_METHOD;
+                return true;
 		break;
 	      default:
 		rb_bug("vm_defined: unreachable: %u", (unsigned int)METHOD_ENTRY_VISI(me));
 	    }
 	}
 	else {
-	    expr_type = check_respond_to_missing(obj, v);
+	    return check_respond_to_missing(obj, v);
 	}
 	break;
       }
       case DEFINED_YIELD:
 	if (GET_BLOCK_HANDLER() != VM_BLOCK_HANDLER_NONE) {
-	    expr_type = DEFINED_YIELD;
+            return true;
 	}
 	break;
       case DEFINED_ZSUPER:
@@ -4063,16 +4076,12 @@ vm_defined(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, rb_num_t op_
 		VALUE klass = vm_search_normal_superclass(me->defined_class);
 		ID id = me->def->original_id;
 
-		if (rb_method_boundp(klass, id, 0)) {
-		    expr_type = DEFINED_ZSUPER;
-		}
+		return rb_method_boundp(klass, id, 0);
 	    }
 	}
 	break;
       case DEFINED_REF:{
-	if (vm_getspecial(ec, GET_LEP(), Qfalse, FIX2INT(obj)) != Qnil) {
-	    expr_type = DEFINED_GVAR;
-	}
+	return vm_getspecial(ec, GET_LEP(), Qfalse, FIX2INT(obj)) != Qnil;
 	break;
       }
       default:
@@ -4080,17 +4089,7 @@ vm_defined(rb_execution_context_t *ec, rb_control_frame_t *reg_cfp, rb_num_t op_
 	break;
     }
 
-    if (expr_type != 0) {
-	if (needstr != Qfalse) {
-	    return rb_iseq_defined_string(expr_type);
-	}
-	else {
-	    return Qtrue;
-	}
-    }
-    else {
-	return Qnil;
-    }
+    return false;
 }
 
 static const VALUE *

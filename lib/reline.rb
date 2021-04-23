@@ -231,9 +231,7 @@ module Reline
       unless config.test_mode
         config.read
         config.reset_default_key_bindings
-        Reline::IOGate::RAW_KEYSTROKE_CONFIG.each_pair do |key, func|
-          config.add_default_key_binding(key, func)
-        end
+        Reline::IOGate.set_default_key_bindings(config)
       end
 
       line_editor.rerender
@@ -444,6 +442,10 @@ module Reline
       core.filename_quote_characters = ""
       core.special_prefixes = ""
     }
+  end
+
+  def self.ungetc(c)
+    Reline::IOGate.ungetc(c)
   end
 
   def self.line_editor
